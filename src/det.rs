@@ -2,14 +2,17 @@
 //!
 //! Provides text region detection functionality based on PaddleOCR detection models
 
-use image::{DynamicImage, GenericImageView};
-use ndarray::ArrayD;
-use std::path::Path;
-
 use crate::error::{OcrError, OcrResult};
 use crate::mnn::{InferenceConfig, InferenceEngine};
 use crate::postprocess::{extract_boxes_with_unclip, TextBox};
 use crate::preprocess::{preprocess_for_det, NormalizeParams};
+use image::{DynamicImage, GenericImageView, RgbImage};
+use imageproc::point::Point;
+use ndarray::ArrayD;
+use std::path::Path;
+
+use opencv::core::{Vec3s, DECOMP_SVD};
+use opencv::{core, imgproc, prelude::*};
 
 /// Detection precision mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -220,20 +223,28 @@ impl DetModel {
         let (width, height) = image.dimensions();
 
         let mut results = Vec::with_capacity(boxes.len());
+        let rgb_image = image.to_rgb8();
 
         for text_box in boxes {
-            // Expand bounding box
             let expanded = text_box.expand(self.options.box_border, width, height);
 
-            // Crop image
-            let cropped = image.crop_imm(
-                expanded.rect.left() as u32,
-                expanded.rect.top() as u32,
-                expanded.rect.width(),
-                expanded.rect.height(),
-            );
+            if let Some(points) = text_box.points {
+                let cropped = self
+                    .crop_perspective(&rgb_image, points)
+                    .map_err(|e| {
+                        OcrError::DetectionError(format!("Failed to crop image: {}", e))
+                    })?;
+                results.push((cropped, expanded));
+            } else {
+                let cropped = image.crop_imm(
+                    expanded.rect.left() as u32,
+                    expanded.rect.top() as u32,
+                    expanded.rect.width(),
+                    expanded.rect.height(),
+                );
 
-            results.push((cropped, expanded));
+                results.push((cropped, expanded));
+            }
         }
 
         Ok(results)
@@ -337,6 +348,99 @@ impl DetModel {
         );
 
         Ok(boxes)
+    }
+}
+
+impl DetModel {
+    fn order_quad(&self, mut pts: [Point<f32>; 4]) -> [Point<f32>; 4] {
+        pts.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap());
+
+        let (top, bottom) = pts.split_at_mut(2);
+
+        top.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+        bottom.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+
+        [
+            top[0],    // TL
+            top[1],    // TR
+            bottom[1], // BR
+            bottom[0], // BL
+        ]
+    }
+
+    fn auto_rotate(&self, img: DynamicImage) -> DynamicImage {
+        let w = img.width();
+        let h = img.height();
+
+        // коэффициент — можно тюнить
+        let aspect_threshold = 1.2;
+
+        if (h as f32) > (w as f32) * aspect_threshold {
+            img.rotate270()
+        } else {
+            img
+        }
+    }
+
+    fn crop_perspective(
+        &self,
+        image: &RgbImage,
+        quad: [Point<f32>; 4],
+    ) -> opencv::Result<DynamicImage> {
+        let quad = self.order_quad(quad);
+
+        let w1 = ((quad[1].x - quad[0].x).hypot(quad[1].y - quad[0].y)) as i32;
+        let w2 = ((quad[2].x - quad[3].x).hypot(quad[2].y - quad[3].y)) as i32;
+        let h1 = ((quad[3].x - quad[0].x).hypot(quad[3].y - quad[0].y)) as i32;
+        let h2 = ((quad[2].x - quad[1].x).hypot(quad[2].y - quad[1].y)) as i32;
+
+        let width = w1.max(w2).max(1);
+        let height = h1.max(h2).max(1);
+
+        // src points
+        let src = Mat::from_slice_2d(&[
+            [quad[0].x, quad[0].y],
+            [quad[1].x, quad[1].y],
+            [quad[2].x, quad[2].y],
+            [quad[3].x, quad[3].y],
+        ])?;
+
+        // dst points
+        let dst = Mat::from_slice_2d(&[
+            [0.0, 0.0],
+            [width as f32, 0.0],
+            [width as f32, height as f32],
+            [0.0, height as f32],
+        ])?;
+
+        let m = imgproc::get_perspective_transform(&src, &dst, DECOMP_SVD)?;
+
+        // image → Mat
+        let mat_ref = Mat::from_bytes::<core::Vec3b>(image.as_raw())?;
+        let mat = mat_ref.reshape(3, image.height() as i32)?;
+
+        let mut warped = core::Mat::default();
+        imgproc::warp_perspective(
+            &mat,
+            &mut warped,
+            &m,
+            core::Size::new(width, height),
+            imgproc::INTER_LINEAR,
+            core::BORDER_CONSTANT,
+            core::Scalar::default(),
+        )?;
+
+        // Mat → DynamicImage
+        let warped_rgb = RgbImage::from_raw(
+            warped.cols() as u32,
+            warped.rows() as u32,
+            warped.data_bytes()?.to_vec(),
+        )
+            .unwrap();
+
+        let rotated = self.auto_rotate(DynamicImage::ImageRgb8(warped_rgb));
+
+        Ok(rotated)
     }
 }
 

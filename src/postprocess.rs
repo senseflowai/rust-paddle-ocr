@@ -6,6 +6,7 @@ use image::GrayImage;
 use imageproc::contours::{find_contours, Contour};
 use imageproc::point::Point;
 use imageproc::rect::Rect;
+use nalgebra::{Matrix2, Vector2};
 
 /// Text bounding box
 #[derive(Debug, Clone)]
@@ -218,12 +219,148 @@ pub fn extract_boxes_with_unclip(
         let final_h = scaled_h.min(original_height.saturating_sub(final_y));
 
         if final_w > 0 && final_h > 0 {
+            let points: Vec<Point<f32>> = contour
+                .points
+                .iter()
+                .map(|p| Point {
+                    x: p.x as f32,
+                    y: p.y as f32,
+                })
+                .collect();
+
+            let box4 = rotated_bbox(&points);
+
+            let box4_original = scale_rect_to_original(
+                box4,
+                original_width,
+                original_height,
+                valid_width,
+                valid_height,
+            );
+
+            let box4_padded = add_padding_rotated_rect(box4_original, 10.0, 10.0);
+
+            let box4_clamped = clamp_rect(box4_padded, original_width, original_height);
+
             let rect = Rect::at(final_x as i32, final_y as i32).of_size(final_w, final_h);
-            boxes.push(TextBox::new(rect, 1.0));
+            boxes.push(TextBox::with_points(rect, 1.0, box4_clamped));
         }
     }
 
     boxes
+}
+
+pub fn rotated_bbox(points: &[Point<f32>]) -> [Point<f32>; 4] {
+    let mean = points
+        .iter()
+        .fold(Vector2::zeros(), |acc, p| acc + Vector2::new(p.x, p.y))
+        / points.len() as f32;
+
+    let mut cov = Matrix2::zeros();
+    for p in points {
+        let v = Vector2::new(p.x, p.y) - mean;
+        cov += v * v.transpose();
+    }
+
+    let eig = cov.symmetric_eigen();
+
+    // главная ось
+    let axis_x = eig.eigenvectors.column(1).normalize();
+    let axis_y = Vector2::new(-axis_x.y, axis_x.x);
+
+    let mut min_x = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut min_y = f32::MAX;
+    let mut max_y = f32::MIN;
+
+    for p in points {
+        let v = Vector2::new(p.x, p.y) - mean;
+        let x = v.dot(&axis_x);
+        let y = v.dot(&axis_y);
+
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+
+    let corners = [
+        mean + axis_x * min_x + axis_y * min_y,
+        mean + axis_x * max_x + axis_y * min_y,
+        mean + axis_x * max_x + axis_y * max_y,
+        mean + axis_x * min_x + axis_y * max_y,
+    ];
+
+    [
+        Point {
+            x: corners[0].x,
+            y: corners[0].y,
+        },
+        Point {
+            x: corners[1].x,
+            y: corners[1].y,
+        },
+        Point {
+            x: corners[2].x,
+            y: corners[2].y,
+        },
+        Point {
+            x: corners[3].x,
+            y: corners[3].y,
+        },
+    ]
+}
+
+fn add_padding_rotated_rect(rect: [Point<f32>; 4], pad_x: f32, pad_y: f32) -> [Point<f32>; 4] {
+    // центр прямоугольника
+    let center = rect
+        .iter()
+        .fold(Vector2::zeros(), |acc, p| acc + Vector2::new(p.x, p.y))
+        / 4.0;
+
+    // локальные оси
+    let axis_x = {
+        let v = Vector2::new(rect[1].x - rect[0].x, rect[1].y - rect[0].y);
+        v.normalize()
+    };
+
+    let axis_y = Vector2::new(-axis_x.y, axis_x.x);
+
+    rect.map(|p| {
+        let v = Vector2::new(p.x, p.y) - center;
+
+        let x = v.dot(&axis_x);
+        let y = v.dot(&axis_y);
+
+        let new_x = if x >= 0.0 { x + pad_x } else { x - pad_x };
+        let new_y = if y >= 0.0 { y + pad_y } else { y - pad_y };
+
+        let out = center + axis_x * new_x + axis_y * new_y;
+        Point { x: out.x, y: out.y }
+    })
+}
+
+pub fn scale_rect_to_original(
+    rect: [Point<f32>; 4],
+    original_width: u32,
+    original_height: u32,
+    mask_width: u32,
+    mask_height: u32,
+) -> [Point<f32>; 4] {
+    let scale_x = original_width as f32 / mask_width as f32;
+    let scale_y = original_height as f32 / mask_height as f32;
+
+    rect.map(|p| Point {
+        x: p.x * scale_x,
+        y: p.y * scale_y,
+    })
+}
+
+fn clamp_rect(rect: [Point<f32>; 4], width: u32, height: u32) -> [Point<f32>; 4] {
+    rect.map(|p| Point {
+        x: p.x.clamp(0.0, (width - 1) as f32),
+        y: p.y.clamp(0.0, (height - 1) as f32),
+    })
 }
 
 /// Get contour bounds
